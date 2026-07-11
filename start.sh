@@ -1,4 +1,4 @@
 #!/bin/bash
 # Start WaterReminder
-open /Applications/water/WaterReminder.app
+open "$(dirname "$0")/WaterReminder.app"
 echo "💧 WaterReminder 已启动"
