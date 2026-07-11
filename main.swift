@@ -50,9 +50,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var timer: Timer?
     private var weatherTimer: Timer?
     private var startTime: Date?
+    private var isSnoozing = false
+    private var hasNotifiedGoalToday = false
+
+    // MARK: - 天气
 
     private var currentWeather: WeatherType = .unknown
     private var temperature: String = ""
+
+    // MARK: - 饮水记录
+
+    private var todayIntake: Double {
+        get { UserDefaults.standard.double(forKey: "todayIntake") }
+        set { UserDefaults.standard.set(newValue, forKey: "todayIntake") }
+    }
+    private var drinkLogDate: String {
+        get { UserDefaults.standard.string(forKey: "drinkLogDate") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "drinkLogDate") }
+    }
+    private var dailyGoal: Double {
+        get {
+            let v = UserDefaults.standard.double(forKey: "dailyGoal")
+            return v > 0 ? v : 2000
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "dailyGoal") }
+    }
+
+    // MARK: - 提醒间隔
 
     private var reminderIntervalMinutes: Int {
         get {
@@ -61,7 +85,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         set { UserDefaults.standard.set(newValue, forKey: "reminderIntervalMinutes") }
     }
-    private var reminderIntervalSeconds: TimeInterval { TimeInterval(reminderIntervalMinutes * 60) }
+
+    /// 实际生效的间隔（考虑高温自动调整）
+    private var effectiveIntervalMinutes: Int {
+        if let tempVal = Double(temperature), tempVal >= 30 {
+            return max(15, reminderIntervalMinutes / 2)
+        }
+        return reminderIntervalMinutes
+    }
+
+    private var effectiveIntervalSeconds: TimeInterval {
+        TimeInterval(effectiveIntervalMinutes * 60)
+    }
+
+    // MARK: - 工作时段
+
+    private var workingHoursEnabled: Bool {
+        get {
+            UserDefaults.standard.object(forKey: "workingHoursEnabled") != nil
+                ? UserDefaults.standard.bool(forKey: "workingHoursEnabled") : true
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "workingHoursEnabled") }
+    }
+    private var workStartHour: Int {
+        get {
+            UserDefaults.standard.object(forKey: "workStartHour") != nil
+                ? UserDefaults.standard.integer(forKey: "workStartHour") : 9
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "workStartHour") }
+    }
+    private var workEndHour: Int {
+        get {
+            UserDefaults.standard.object(forKey: "workEndHour") != nil
+                ? UserDefaults.standard.integer(forKey: "workEndHour") : 22
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "workEndHour") }
+    }
+
+    // MARK: - 提醒文案
 
     private let quotes: [(String, String)] = [
         ("喝杯水吧 🌿", "忙碌的你，记得让身体也喘口气。温水已备好，歇一歇再继续。"),
@@ -110,29 +171,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     // MARK: - 启动
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 加载缓存的天气
+        loadCachedWeather()
+
+        // 校验并重置每日饮水记录
+        checkAndResetDailyLog()
+
+        // 设置通知分类（交互式按钮）
+        setupNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
 
+        // 状态栏
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenuBarIcon()
+        buildMenu()
 
-        // 菜单
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "喝水提醒", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(weatherInfoItem())
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "提醒一次", action: #selector(remindNow), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "重置计时", action: #selector(resetTimer), keyEquivalent: "t"))
-        menu.addItem(intervalMenuItem())
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "查看状态", action: #selector(showStatus), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "刷新天气", action: #selector(refreshWeather), keyEquivalent: "w"))
-        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
-        statusItem.menu = menu
-
-        // 通知权限
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+        // 请求通知权限并启动
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
             DispatchQueue.main.async {
                 self.startTimer()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
@@ -141,17 +196,376 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
         }
 
-        // 获取天气
+        // 天气
         fetchWeather()
         weatherTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.fetchWeather()
         }
+
+        // 睡眠/唤醒监听
+        setupSleepWakeHandling()
+    }
+
+    // MARK: - 每日记录
+
+    private func checkAndResetDailyLog() {
+        let today = dateString()
+        if drinkLogDate != today {
+            todayIntake = 0
+            drinkLogDate = today
+            hasNotifiedGoalToday = false
+        }
+    }
+
+    private func dateString() -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: Date())
+    }
+
+    // MARK: - 交互式通知
+
+    private func setupNotificationCategories() {
+        let drank50 = UNNotificationAction(identifier: "DRANK_50", title: "✅ 喝了 50ml", options: [])
+        let drank100 = UNNotificationAction(identifier: "DRANK_100", title: "✅ 喝了 100ml", options: [])
+        let drank250 = UNNotificationAction(identifier: "DRANK_250", title: "✅ 喝了 250ml", options: [])
+        let drank500 = UNNotificationAction(identifier: "DRANK_500", title: "✅ 喝了 500ml", options: [])
+        let snooze10 = UNNotificationAction(identifier: "SNOOZE_10", title: "⏰ 10 分钟后", options: [])
+        let snooze30 = UNNotificationAction(identifier: "SNOOZE_30", title: "⏰ 30 分钟后", options: [])
+        let category = UNNotificationCategory(
+            identifier: "WATER_REMINDER",
+            actions: [drank50, drank100, drank250, drank500, snooze10, snooze30],
+            intentIdentifiers: [],
+            options: []
+        )
+        UNUserNotificationCenter.current().setNotificationCategories([category])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        switch response.actionIdentifier {
+        case "DRANK_50":
+            logDrink(amount: 50)
+            startTimer()
+        case "DRANK_100":
+            logDrink(amount: 100)
+            startTimer()
+        case "DRANK_250":
+            logDrink(amount: 250)
+            startTimer()
+        case "DRANK_500":
+            logDrink(amount: 500)
+            startTimer()
+        case "SNOOZE_10":
+            snoozeReminder(minutes: 10)
+        case "SNOOZE_30":
+            snoozeReminder(minutes: 30)
+        default:
+            break
+        }
+        completionHandler()
+    }
+
+    // MARK: - 饮水记录
+
+    private func logDrink(amount: Double) {
+        checkAndResetDailyLog()
+        todayIntake += amount
+        buildMenu()
+
+        let pct = min(Int(todayIntake / dailyGoal * 100), 100)
+        print("💧 Drank \(Int(todayIntake))ml / \(Int(dailyGoal))ml (\(pct)%)")
+
+        if todayIntake >= dailyGoal, !hasNotifiedGoalToday {
+            hasNotifiedGoalToday = true
+            let content = UNMutableNotificationContent()
+            content.title = "🎉 喝水目标达成！"
+            content.body = "今日已喝 \(Int(todayIntake))ml，太棒了！继续保持 💪"
+            content.sound = .default
+            let req = UNNotificationRequest(
+                identifier: "goal_\(UUID().uuidString)",
+                content: content,
+                trigger: nil
+            )
+            UNUserNotificationCenter.current().add(req)
+        }
+    }
+
+    @objc private func logDrink50() {
+        logDrink(amount: 50)
+        startTimer()
+        showAlert(title: "已记录 👍", body: "+50ml · 今日共 \(Int(todayIntake))ml / \(Int(dailyGoal))ml")
+    }
+
+    @objc private func logDrink100() {
+        logDrink(amount: 100)
+        startTimer()
+        showAlert(title: "已记录 👍", body: "+100ml · 今日共 \(Int(todayIntake))ml / \(Int(dailyGoal))ml")
+    }
+
+    @objc private func logDrink250() {
+        logDrink(amount: 250)
+        startTimer()
+        showAlert(title: "已记录 👍", body: "+250ml · 今日共 \(Int(todayIntake))ml / \(Int(dailyGoal))ml")
+    }
+
+    @objc private func logDrink500() {
+        logDrink(amount: 500)
+        startTimer()
+        showAlert(title: "已记录 👍", body: "+500ml · 今日共 \(Int(todayIntake))ml / \(Int(dailyGoal))ml")
+    }
+
+    // MARK: - 菜单
+
+    private var todayProgressBar: String {
+        let pct = min(Int(todayIntake / dailyGoal * 100), 100)
+        if pct >= 100 { return "🎉 \(Int(todayIntake))ml ✓" }
+        let filled = pct / 10
+        return "\(Int(todayIntake))/\(Int(dailyGoal))ml " + String(repeating: "█", count: filled)
+            + String(repeating: "░", count: 10 - filled)
+    }
+
+    private func buildMenu() {
+        let menu = NSMenu()
+
+        menu.addItem(NSMenuItem(title: "喝水提醒", action: nil, keyEquivalent: ""))
+
+        menu.addItem(NSMenuItem.separator())
+
+        // 今日饮水进度
+        let progressTitle = "  💧 \(todayProgressBar)"
+        let progressItem = NSMenuItem(title: progressTitle, action: nil, keyEquivalent: "")
+        progressItem.isEnabled = false
+        menu.addItem(progressItem)
+
+        // 快速记录
+        menu.addItem(NSMenuItem(title: "喝了一小口 (50ml)", action: #selector(logDrink50), keyEquivalent: "s"))
+        menu.addItem(NSMenuItem(title: "喝了一小杯 (100ml)", action: #selector(logDrink100), keyEquivalent: "S"))
+        menu.addItem(NSMenuItem(title: "喝了一杯水 (250ml)", action: #selector(logDrink250), keyEquivalent: "d"))
+        menu.addItem(NSMenuItem(title: "喝了一大杯 (500ml)", action: #selector(logDrink500), keyEquivalent: "D"))
+        menu.addItem(goalMenuItem())
+
+        menu.addItem(NSMenuItem.separator())
+
+        // 天气信息
+        menu.addItem(weatherInfoItem())
+
+        // 高温模式提示
+        if let tempVal = Double(temperature), tempVal >= 30 {
+            let hotItem = NSMenuItem(title: "  🔥 高温模式：间隔缩短至 \(effectiveIntervalMinutes) 分钟", action: nil, keyEquivalent: "")
+            hotItem.isEnabled = false
+            menu.addItem(hotItem)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+
+        // 提醒操作
+        menu.addItem(NSMenuItem(title: "提醒一次", action: #selector(remindNow), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "重置计时", action: #selector(resetTimer), keyEquivalent: "t"))
+        menu.addItem(intervalMenuItem())
+        menu.addItem(workingHoursMenuItem())
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "查看状态", action: #selector(showStatus), keyEquivalent: "s"))
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(NSMenuItem(title: "刷新天气", action: #selector(refreshWeather), keyEquivalent: "w"))
+        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
+
+        statusItem.menu = menu
+    }
+
+    // MARK: - 每日目标子菜单
+
+    private func goalMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "每日目标  \(Int(dailyGoal))ml ▸", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let presets: [Double] = [1000, 1500, 2000, 2500, 3000]
+        for p in presets {
+            let mi = NSMenuItem(
+                title: "\(Int(p))ml" + (p == 2000 ? " (推荐)" : ""),
+                action: #selector(setGoalPreset(_:)),
+                keyEquivalent: ""
+            )
+            mi.tag = Int(p)
+            mi.state = p == dailyGoal ? .on : .off
+            sub.addItem(mi)
+        }
+        sub.addItem(NSMenuItem.separator())
+        sub.addItem(NSMenuItem(title: "自定义...", action: #selector(promptCustomGoal), keyEquivalent: ""))
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func setGoalPreset(_ sender: NSMenuItem) {
+        dailyGoal = Double(sender.tag)
+        buildMenu()
+    }
+
+    @objc private func promptCustomGoal() {
+        let alert = NSAlert()
+        alert.messageText = "自定义每日目标"
+        alert.informativeText = "请输入每日目标饮水量（毫升）："
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 24))
+        tf.placeholderString = "\(Int(dailyGoal))"
+        tf.stringValue = "\(Int(dailyGoal))"
+        alert.accessoryView = tf
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let val = Int(tf.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0
+        guard val >= 500, val <= 10000 else {
+            showAlert(title: "无效输入", body: "请输入 500 ~ 10000 之间的整数。")
+            return
+        }
+        dailyGoal = Double(val)
+        buildMenu()
+    }
+
+    // MARK: - 工作时段子菜单
+
+    private func workingHoursMenuItem() -> NSMenuItem {
+        let status: String
+        if workingHoursEnabled {
+            status = "\(workStartHour):00-\(workEndHour):00"
+        } else {
+            status = "全天"
+        }
+        let item = NSMenuItem(title: "工作时段  \(status) ▸", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+
+        let toggleTitle = workingHoursEnabled ? "关闭时段限制" : "启用时段限制"
+        sub.addItem(NSMenuItem(title: toggleTitle, action: #selector(toggleWorkingHours), keyEquivalent: ""))
+        sub.addItem(NSMenuItem.separator())
+
+        let presets: [(Int, Int)] = [(9, 22), (8, 22), (9, 23), (10, 22)]
+        let labels = ["9:00 - 22:00", "8:00 - 22:00", "9:00 - 23:00", "10:00 - 22:00"]
+        for (i, (s, e)) in presets.enumerated() {
+            let mi = NSMenuItem(title: labels[i], action: #selector(setWorkHoursPreset(_:)), keyEquivalent: "")
+            mi.tag = s * 100 + e
+            mi.state = (workingHoursEnabled && s == workStartHour && e == workEndHour) ? .on : .off
+            sub.addItem(mi)
+        }
+        sub.addItem(NSMenuItem.separator())
+        sub.addItem(NSMenuItem(title: "自定义...", action: #selector(promptCustomWorkHours), keyEquivalent: ""))
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func toggleWorkingHours() {
+        workingHoursEnabled = !workingHoursEnabled
+        buildMenu()
+        if workingHoursEnabled { rescheduleIfOutsideHours() }
+    }
+
+    @objc private func setWorkHoursPreset(_ sender: NSMenuItem) {
+        workStartHour = sender.tag / 100
+        workEndHour = sender.tag % 100
+        workingHoursEnabled = true
+        buildMenu()
+        rescheduleIfOutsideHours()
+    }
+
+    @objc private func promptCustomWorkHours() {
+        let alert = NSAlert()
+        alert.messageText = "自定义工作时段"
+        alert.informativeText = "请输入起始和结束小时（0~23，例如 9 和 22）："
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 40))
+        let startField = NSTextField(frame: NSRect(x: 0, y: 20, width: 80, height: 24))
+        startField.placeholderString = "起始"
+        startField.stringValue = "\(workStartHour)"
+        let endField = NSTextField(frame: NSRect(x: 140, y: 20, width: 80, height: 24))
+        endField.placeholderString = "结束"
+        endField.stringValue = "\(workEndHour)"
+        view.addSubview(startField)
+        view.addSubview(endField)
+        alert.accessoryView = view
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let s = Int(startField.stringValue.trimmingCharacters(in: .whitespaces)) ?? -1
+        let e = Int(endField.stringValue.trimmingCharacters(in: .whitespaces)) ?? -1
+        guard s >= 0, s <= 23, e >= 0, e <= 23, s < e else {
+            showAlert(title: "无效输入", body: "请输入 0~23 之间的整数，且起始 < 结束。")
+            return
+        }
+        workStartHour = s
+        workEndHour = e
+        workingHoursEnabled = true
+        buildMenu()
+        rescheduleIfOutsideHours()
+    }
+
+    private func rescheduleIfOutsideHours() {
+        guard workingHoursEnabled, let nextStart = nextWorkStartDate() else { return }
+        let interval = nextStart.timeIntervalSinceNow
+        guard interval > 0 else { return }
+
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.sendNotification()
+            self.startTimer()
+        }
+    }
+
+    private func isWithinWorkingHours() -> Bool {
+        guard workingHoursEnabled else { return true }
+        let hour = Calendar.current.component(.hour, from: Date())
+        return hour >= workStartHour && hour < workEndHour
+    }
+
+    private func nextWorkStartDate() -> Date? {
+        guard workingHoursEnabled else { return nil }
+        let now = Date()
+        let cal = Calendar.current
+        let hour = cal.component(.hour, from: now)
+
+        if hour < workStartHour {
+            // 今天的起始时间还没到
+            var comps = cal.dateComponents([.year, .month, .day], from: now)
+            comps.hour = workStartHour
+            comps.minute = 0
+            comps.second = 0
+            return cal.date(from: comps)
+        } else if hour >= workEndHour {
+            // 已经过了结束时间 → 明天
+            var comps = cal.dateComponents([.year, .month, .day], from: now)
+            guard let tomorrow = comps.day.map({ $0 + 1 }) else { return nil }
+            comps.day = tomorrow
+            comps.hour = workStartHour
+            comps.minute = 0
+            comps.second = 0
+            return cal.date(from: comps)
+        }
+        return nil // 正在工作时段内
     }
 
     // MARK: - 天气 (ip-api.com + Open-Meteo)
 
+    private func loadCachedWeather() {
+        if UserDefaults.standard.object(forKey: "cachedWeatherCode") != nil {
+            let code = UserDefaults.standard.integer(forKey: "cachedWeatherCode")
+            currentWeather = WeatherType.from(wmoCode: code)
+        }
+        temperature = UserDefaults.standard.string(forKey: "cachedTemperature") ?? ""
+    }
+
+    private func cacheWeather(code: Int, temp: String) {
+        UserDefaults.standard.set(code, forKey: "cachedWeatherCode")
+        UserDefaults.standard.set(temp, forKey: "cachedTemperature")
+    }
+
     private func fetchWeather() {
-        // Step 1: IP 定位（ipinfo.io，免费 HTTPS，无需 key）
         let geoURL = URL(string: "https://ipinfo.io/json")!
 
         let geoTask = URLSession.shared.dataTask(with: geoURL) { [weak self] data, _, error in
@@ -167,12 +581,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 lat = parts.first ?? 39.9042
                 lon = parts.count > 1 ? parts[1] : 116.4074
             } else {
-                // 定位失败 → 默认北京
                 lat = 39.9042
                 lon = 116.4074
             }
 
-            // Step 2: Open-Meteo 天气
             let wStr = "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)&current=weather_code,temperature_2m&timezone=auto"
             guard let wURL = URL(string: wStr) else { return }
 
@@ -181,15 +593,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let current = json["current"] as? [String: Any],
                       let code = current["weather_code"] as? Int,
-                      let temp = current["temperature_2m"] as? Double else {
-                    return
-                }
+                      let temp = current["temperature_2m"] as? Double else { return }
 
                 DispatchQueue.main.async {
                     self.currentWeather = WeatherType.from(wmoCode: code)
-                    self.temperature = String(format: "%.0f", temp)
+                    let tempStr = String(format: "%.0f", temp)
+                    self.temperature = tempStr
+                    self.cacheWeather(code: code, temp: tempStr)
                     self.updateMenuBarIcon()
-                    self.updateWeatherInfo()
+                    // 天气变化了 → 重新建菜单（高温模式可能开关）
+                    self.buildMenu()
                 }
             }.resume()
         }
@@ -198,16 +611,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     @objc private func refreshWeather() {
         fetchWeather()
-        showInfoAlert(title: "刷新天气", body: "正在获取最新天气 ...")
-    }
-
-    private func updateWeatherInfo() {
-        guard let menu = statusItem?.menu, menu.items.count > 2 else { return }
-        let newItem = weatherInfoItem()
-        if let old = menu.item(at: 2) {
-            menu.insertItem(newItem, at: 2)
-            menu.removeItem(old)
-        }
+        showAlert(title: "刷新天气", body: "正在获取最新天气 ...")
     }
 
     private func weatherInfoItem() -> NSMenuItem {
@@ -231,80 +635,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let item = NSMenuItem(title: "  " + display, action: nil, keyEquivalent: "")
         item.isEnabled = false
         return item
-    }
-
-    // MARK: - 提醒间隔设置
-
-    private func intervalMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "提醒间隔   \(friendlyInterval) ▸", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        let presets = [30, 60, 90, 120, 180]
-        for p in presets {
-            let label = p >= 60 ? "\(p / 60) 小时" : "\(p) 分钟"
-            let mi = NSMenuItem(title: label + (p == 120 ? " (默认)" : ""),
-                                action: #selector(setIntervalPreset(_:)),
-                                keyEquivalent: "")
-            mi.tag = p
-            mi.state = p == reminderIntervalMinutes ? .on : .off
-            sub.addItem(mi)
-        }
-        sub.addItem(NSMenuItem.separator())
-        sub.addItem(NSMenuItem(title: "自定义...", action: #selector(promptCustomInterval), keyEquivalent: ""))
-        item.submenu = sub
-        return item
-    }
-
-    @objc private func setIntervalPreset(_ sender: NSMenuItem) {
-        let minutes = sender.tag
-        guard minutes > 0 else { return }
-        reminderIntervalMinutes = minutes
-        rebuildMenu()
-        startTimer()
-        showInfoAlert(title: "间隔已设置", body: "每 \(friendlyInterval) 提醒一次。")
-    }
-
-    @objc private func promptCustomInterval() {
-        let alert = NSAlert()
-        alert.messageText = "自定义提醒间隔"
-        alert.informativeText = "请输入间隔分钟数（10 ~ 480）："
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
-
-        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 24))
-        tf.placeholderString = "\(reminderIntervalMinutes)"
-        tf.stringValue = "\(reminderIntervalMinutes)"
-        alert.accessoryView = tf
-
-        let resp = alert.runModal()
-        guard resp == .alertFirstButtonReturn else { return }
-
-        let minutes = Int(tf.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0
-        guard minutes >= 10, minutes <= 480 else {
-            showInfoAlert(title: "无效输入", body: "请输入 10 ~ 480 之间的整数。")
-            return
-        }
-
-        reminderIntervalMinutes = minutes
-        rebuildMenu()
-        startTimer()
-        showInfoAlert(title: "间隔已设置", body: "每 \(friendlyInterval) 提醒一次。")
-    }
-
-    private func rebuildMenu() {
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "喝水提醒", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(weatherInfoItem())
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "提醒一次", action: #selector(remindNow), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "重置计时", action: #selector(resetTimer), keyEquivalent: "t"))
-        menu.addItem(intervalMenuItem())
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "查看状态", action: #selector(showStatus), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "刷新天气", action: #selector(refreshWeather), keyEquivalent: "w"))
-        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
-        statusItem.menu = menu
     }
 
     // MARK: - 图标（SF Symbols）
@@ -362,29 +692,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private func startTimer() {
         timer?.invalidate()
+        isSnoozing = false
         startTime = Date()
-        timer = Timer.scheduledTimer(timeInterval: reminderIntervalSeconds, target: self, selector: #selector(timerFired), userInfo: nil, repeats: true)
+        timer = Timer.scheduledTimer(
+            timeInterval: effectiveIntervalSeconds,
+            target: self,
+            selector: #selector(timerFired),
+            userInfo: nil,
+            repeats: true
+        )
     }
 
     @objc private func timerFired() {
-        sendNotification()
+        if isWithinWorkingHours() {
+            sendNotification()
+        } else {
+            rescheduleIfOutsideHours()
+        }
     }
 
-    // MARK: - 通知
+    // MARK: - 提醒
 
     private func sendNotification() {
+        startTime = Date()
         let (title, body) = nextMessage()
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
+        content.categoryIdentifier = "WATER_REMINDER"
 
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
                 print("Notification failed: \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    self.showAlertFallback(title: title, body: body)
+                    self.showAlert(title: title, body: body)
                 }
             }
         }
@@ -394,25 +737,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         quotes.randomElement() ?? ("喝杯水吧 💧", "该喝水了，去倒一杯温水吧。")
     }
 
-    private func showAlertFallback(title: String, body: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = body
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "好的")
-        alert.runModal()
+    private func snoozeReminder(minutes: Int) {
+        isSnoozing = true
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(minutes * 60), repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.isSnoozing = false
+            self.sendNotification()
+            self.startTimer()
+        }
+    }
+
+    // MARK: - 睡眠/唤醒
+
+    private func setupSleepWakeHandling() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(onWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func onWake() {
+        guard let start = startTime, !isSnoozing else { return }
+        let elapsed = -start.timeIntervalSinceNow
+
+        // 如果睡眠时间超过了 1.5 倍间隔，认为错过了提醒
+        if elapsed >= effectiveIntervalSeconds * 1.5 {
+            if isWithinWorkingHours() {
+                print("💤 Woke from sleep, missed reminder (elapsed: \(Int(elapsed/60))min)")
+                sendNotification()
+            }
+            startTimer()
+        }
     }
 
     // MARK: - 菜单操作
 
     @objc private func remindNow() {
+        isSnoozing = false
         sendNotification()
         startTimer()
     }
 
     @objc private func resetTimer() {
         startTimer()
-        showInfoAlert(title: "计时器已重置", body: "从现在开始，每 \(friendlyInterval) 提醒一次。")
+        showAlert(title: "计时器已重置", body: "从现在开始，每 \(friendlyInterval) 提醒一次。")
     }
 
     private var friendlyInterval: String {
@@ -435,10 +806,100 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         } else {
             elapsed = "尚未提醒"
         }
-        showInfoAlert(title: "喝水状态", body: "\(elapsed)\n每 \(friendlyInterval) 自动提醒 ✦")
+
+        var body = "\(elapsed)\n"
+        body += "今日饮水  \(Int(todayIntake)) / \(Int(dailyGoal))ml"
+
+        let pct = min(Int(todayIntake / dailyGoal * 100), 100)
+        if pct >= 100 {
+            body += " 🎉 目标达成！"
+        } else {
+            body += " (\(pct)%)"
+        }
+
+        body += "\n"
+
+        if let tempVal = Double(temperature), tempVal >= 30 {
+            body += "🔥 高温模式：间隔缩短至 \(effectiveIntervalMinutes) 分钟\n"
+        } else {
+            body += "每 \(friendlyInterval) 自动提醒 ✦\n"
+        }
+
+        if workingHoursEnabled {
+            body += "工作时段：\(workStartHour):00 - \(workEndHour):00"
+        } else {
+            body += "全天提醒"
+        }
+
+        showAlert(title: "喝水状态", body: body)
     }
 
-    private func showInfoAlert(title: String, body: String) {
+    @objc private func quitApp() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - 提醒间隔设置
+
+    private func intervalMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "提醒间隔  \(friendlyInterval) ▸", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let presets = [30, 60, 90, 120, 180]
+        for p in presets {
+            let label = p >= 60 ? "\(p / 60) 小时" : "\(p) 分钟"
+            let mi = NSMenuItem(
+                title: label + (p == 120 ? " (默认)" : ""),
+                action: #selector(setIntervalPreset(_:)),
+                keyEquivalent: ""
+            )
+            mi.tag = p
+            mi.state = p == reminderIntervalMinutes ? .on : .off
+            sub.addItem(mi)
+        }
+        sub.addItem(NSMenuItem.separator())
+        sub.addItem(NSMenuItem(title: "自定义...", action: #selector(promptCustomInterval), keyEquivalent: ""))
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func setIntervalPreset(_ sender: NSMenuItem) {
+        let minutes = sender.tag
+        guard minutes > 0 else { return }
+        reminderIntervalMinutes = minutes
+        buildMenu()
+        startTimer()
+        showAlert(title: "间隔已设置", body: "每 \(friendlyInterval) 提醒一次。")
+    }
+
+    @objc private func promptCustomInterval() {
+        let alert = NSAlert()
+        alert.messageText = "自定义提醒间隔"
+        alert.informativeText = "请输入间隔分钟数（10 ~ 480）："
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 24))
+        tf.placeholderString = "\(reminderIntervalMinutes)"
+        tf.stringValue = "\(reminderIntervalMinutes)"
+        alert.accessoryView = tf
+
+        let resp = alert.runModal()
+        guard resp == .alertFirstButtonReturn else { return }
+
+        let minutes = Int(tf.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0
+        guard minutes >= 10, minutes <= 480 else {
+            showAlert(title: "无效输入", body: "请输入 10 ~ 480 之间的整数。")
+            return
+        }
+
+        reminderIntervalMinutes = minutes
+        buildMenu()
+        startTimer()
+        showAlert(title: "间隔已设置", body: "每 \(friendlyInterval) 提醒一次。")
+    }
+
+    // MARK: - 通用弹窗
+
+    private func showAlert(title: String, body: String) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = body
@@ -447,13 +908,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         alert.runModal()
     }
 
-    @objc private func quitApp() {
-        NSApplication.shared.terminate(nil)
-    }
-
     // MARK: - UNUserNotificationCenterDelegate
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
         completionHandler([.banner, .sound])
     }
 }
