@@ -1,6 +1,191 @@
 import Cocoa
 import UserNotifications
 
+// MARK: - 自定义下拉提醒面板
+
+class ReminderPanel: NSPanel {
+    private var dismissTimer: Timer?
+    private var onDismiss: (() -> Void)?
+    private var onDrink: ((Double) -> Void)?
+    private var onSnooze: ((Int) -> Void)?
+    private var retainSelf: ReminderPanel?
+
+    private let panelWidth: CGFloat = 400
+    private let panelHeight: CGFloat = 158
+
+    init(
+        title: String,
+        body: String,
+        onDismiss: @escaping () -> Void,
+        onDrink: @escaping (Double) -> Void,
+        onSnooze: @escaping (Int) -> Void
+    ) {
+        self.onDismiss = onDismiss
+        self.onDrink = onDrink
+        self.onSnooze = onSnooze
+
+        guard let screen = NSScreen.main else {
+            super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: true)
+            return
+        }
+
+        let sf = screen.frame
+        let vf = screen.visibleFrame
+        let menuBarHeight = sf.height - (vf.origin.y + vf.height)
+        let padding: CGFloat = 10
+        let x = vf.origin.x + (vf.width - panelWidth) / 2
+        let visibleY = sf.height - menuBarHeight - panelHeight - padding
+
+        // 从顶部缓缓弹出：初始位置在顶部（高度为0），向下展开
+        super.init(
+            contentRect: NSRect(x: x, y: visibleY + panelHeight, width: panelWidth, height: 0),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: true
+        )
+
+        self.isOpaque = false
+        self.backgroundColor = .clear
+        self.hasShadow = true
+        self.level = .floating
+        self.collectionBehavior = [.canJoinAllSpaces]
+        self.isMovable = false
+        self.ignoresMouseEvents = false
+
+        setupContent(title: title, body: body)
+
+        // 从顶部缓缓弹出：高度从 0 展开到 panelHeight
+        orderFront(nil)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.45
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.animator().setFrame(
+                NSRect(x: x, y: visibleY, width: panelWidth, height: panelHeight),
+                display: true
+            )
+        }
+
+        // 自动消失
+        dismissTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
+            self?.hide()
+        }
+
+        retainSelf = self
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var canBecomeKey: Bool { true }
+
+    private func setupContent(title: String, body: String) {
+        // 容器 view（负责圆角 + 阴影）
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 16
+        container.layer?.masksToBounds = true
+        contentView = container
+
+        // 毛玻璃背景
+        let blur = NSVisualEffectView(frame: container.bounds)
+        blur.autoresizingMask = [.width, .height]
+        blur.blendingMode = .withinWindow
+        blur.state = .active
+        blur.material = .popover
+        container.addSubview(blur)
+
+        // 标题
+        let tl = NSTextField(labelWithString: title)
+        tl.font = .systemFont(ofSize: 15, weight: .semibold)
+        tl.textColor = .labelColor
+        tl.frame = NSRect(x: 20, y: panelHeight - 42, width: panelWidth - 80, height: 22)
+        container.addSubview(tl)
+
+        // 关闭按钮（无边框）
+        let cb = NSButton(frame: NSRect(x: panelWidth - 38, y: panelHeight - 34, width: 22, height: 22))
+        cb.bezelStyle = .inline
+        cb.isBordered = false
+        cb.title = "✕"
+        cb.font = .systemFont(ofSize: 13, weight: .medium)
+        cb.contentTintColor = .secondaryLabelColor
+        cb.target = self
+        cb.action = #selector(tapClose)
+        container.addSubview(cb)
+
+        // 正文
+        let bl = NSTextField(wrappingLabelWithString: body)
+        bl.font = .systemFont(ofSize: 13)
+        bl.textColor = .secondaryLabelColor
+        bl.frame = NSRect(x: 20, y: 72, width: panelWidth - 40, height: 40)
+        container.addSubview(bl)
+
+        // 分量按钮
+        let amounts: [Double] = [50, 100, 250, 500]
+        let btnW: CGFloat = 72, btnH: CGFloat = 30, gap: CGFloat = 6
+        let totalW = CGFloat(amounts.count) * btnW + CGFloat(amounts.count - 1) * gap
+        let startX = (panelWidth - totalW) / 2
+
+        for (i, a) in amounts.enumerated() {
+            let b = NSButton(frame: NSRect(
+                x: startX + CGFloat(i) * (btnW + gap),
+                y: 14, width: btnW, height: btnH
+            ))
+            b.bezelStyle = .rounded
+            b.title = "\(Int(a))ml"
+            b.font = .systemFont(ofSize: 12, weight: .medium)
+            b.target = self
+            b.action = #selector(tapDrink(_:))
+            b.tag = Int(a)
+            container.addSubview(b)
+        }
+
+        // 稍后提醒按钮
+        let sb = NSButton(frame: NSRect(
+            x: startX + CGFloat(amounts.count) * (btnW + gap),
+            y: 14, width: 48, height: btnH
+        ))
+        sb.bezelStyle = .rounded
+        sb.title = "⏰"
+        sb.font = .systemFont(ofSize: 14)
+        sb.target = self
+        sb.action = #selector(tapSnooze)
+        container.addSubview(sb)
+    }
+
+    @objc private func tapDrink(_ sender: NSButton) {
+        onDrink?(Double(sender.tag))
+        hide()
+    }
+
+    @objc private func tapSnooze() {
+        onSnooze?(10)
+        hide()
+    }
+
+    @objc private func tapClose() {
+        onDismiss?()
+        hide()
+    }
+
+    @objc fileprivate func hide() {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+
+        // 收起动画：高度归零，向上折叠
+        let endY = self.frame.origin.y + self.frame.height
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().setFrame(
+                NSRect(x: self.frame.origin.x, y: endY, width: self.frame.width, height: 0),
+                display: true
+            )
+        } completionHandler: { [weak self] in
+            self?.orderOut(nil)
+            self?.retainSelf = nil
+        }
+    }
+}
+
 // MARK: - 天气类型
 
 enum WeatherType: String {
@@ -45,13 +230,15 @@ enum WeatherType: String {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var weatherTimer: Timer?
     private var startTime: Date?
     private var isSnoozing = false
     private var hasNotifiedGoalToday = false
+    private var currentPanel: ReminderPanel?
+    private var toastPanel: NSPanel?
 
     // MARK: - 天气
 
@@ -177,23 +364,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // 校验并重置每日饮水记录
         checkAndResetDailyLog()
 
-        // 设置通知分类（交互式按钮）
-        setupNotificationCategories()
-        UNUserNotificationCenter.current().delegate = self
-
         // 状态栏
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenuBarIcon()
         buildMenu()
 
-        // 请求通知权限并启动
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            DispatchQueue.main.async {
-                self.startTimer()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-                    self.sendNotification()
-                }
-            }
+        // 启动计时器
+        startTimer()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            self.sendNotification()
         }
 
         // 天气
@@ -225,50 +404,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     // MARK: - 交互式通知
 
-    private func setupNotificationCategories() {
-        let drank50 = UNNotificationAction(identifier: "DRANK_50", title: "✅ 喝了 50ml", options: [])
-        let drank100 = UNNotificationAction(identifier: "DRANK_100", title: "✅ 喝了 100ml", options: [])
-        let drank250 = UNNotificationAction(identifier: "DRANK_250", title: "✅ 喝了 250ml", options: [])
-        let drank500 = UNNotificationAction(identifier: "DRANK_500", title: "✅ 喝了 500ml", options: [])
-        let snooze10 = UNNotificationAction(identifier: "SNOOZE_10", title: "⏰ 10 分钟后", options: [])
-        let snooze30 = UNNotificationAction(identifier: "SNOOZE_30", title: "⏰ 30 分钟后", options: [])
-        let category = UNNotificationCategory(
-            identifier: "WATER_REMINDER",
-            actions: [drank50, drank100, drank250, drank500, snooze10, snooze30],
-            intentIdentifiers: [],
-            options: []
-        )
-        UNUserNotificationCenter.current().setNotificationCategories([category])
-    }
-
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
-        switch response.actionIdentifier {
-        case "DRANK_50":
-            logDrink(amount: 50)
-            startTimer()
-        case "DRANK_100":
-            logDrink(amount: 100)
-            startTimer()
-        case "DRANK_250":
-            logDrink(amount: 250)
-            startTimer()
-        case "DRANK_500":
-            logDrink(amount: 500)
-            startTimer()
-        case "SNOOZE_10":
-            snoozeReminder(minutes: 10)
-        case "SNOOZE_30":
-            snoozeReminder(minutes: 30)
-        default:
-            break
-        }
-        completionHandler()
-    }
-
     // MARK: - 饮水记录
 
     private func logDrink(amount: Double) {
@@ -281,16 +416,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         if todayIntake >= dailyGoal, !hasNotifiedGoalToday {
             hasNotifiedGoalToday = true
-            let content = UNMutableNotificationContent()
-            content.title = "🎉 喝水目标达成！"
-            content.body = "今日已喝 \(Int(todayIntake))ml，太棒了！继续保持 💪"
-            content.sound = .default
-            let req = UNNotificationRequest(
-                identifier: "goal_\(UUID().uuidString)",
-                content: content,
-                trigger: nil
+            currentPanel?.hide()
+            currentPanel = ReminderPanel(
+                title: "🎉 喝水目标达成！",
+                body: "今日已喝 \(Int(todayIntake))ml，太棒了！继续保持 💪",
+                onDismiss: {},
+                onDrink: { [weak self] amount in
+                    guard let self = self else { return }
+                    self.logDrink(amount: amount)
+                    self.startTimer()
+                    self.showDrinkConfirmationToast(amount: amount)
+                },
+                onSnooze: { [weak self] minutes in
+                    self?.snoozeReminder(minutes: minutes)
+                }
             )
-            UNUserNotificationCenter.current().add(req)
         }
     }
 
@@ -716,19 +856,121 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private func sendNotification() {
         startTime = Date()
         let (title, body) = nextMessage()
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        content.categoryIdentifier = "WATER_REMINDER"
+        NSSound(named: "Pop")?.play()
 
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
-                print("Notification failed: \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.showAlert(title: title, body: body)
-                }
+        currentPanel?.hide()
+        currentPanel = ReminderPanel(
+            title: title,
+            body: body,
+            onDismiss: {},
+            onDrink: { [weak self] amount in
+                guard let self = self else { return }
+                self.logDrink(amount: amount)
+                self.startTimer()
+                self.showDrinkConfirmationToast(amount: amount)
+            },
+            onSnooze: { [weak self] minutes in
+                self?.snoozeReminder(minutes: minutes)
+            }
+        )
+    }
+
+    // MARK: - 正反馈 Toast
+
+    private func drinkConfirmationMessage() -> String {
+        let pct = Int(todayIntake / dailyGoal * 100)
+
+        if pct >= 100 {
+            return ["🎉 今天的目标完成了，真为你高兴！",
+                    "🌟 太棒了，你好好照顾了自己呢。",
+                    "🏆 今日饮水达标，你很棒！"].randomElement()!
+        }
+        return ["🌿 每一口水，都在悄悄滋养你。",
+                "🌸 嗯，就这样慢慢照顾自己。",
+                "💧 水是最好的礼物，你值得。",
+                "✨ 小小的坚持，会有大大的不同。",
+                "🍃 身体会感谢你的每一杯水。",
+                "☀️ 喝下去的不只是水，是一份温柔。",
+                "🌊 好习惯，就是这样一点点养成的。",
+                "💙 你在好好爱自己，看得见。"].randomElement()!
+    }
+
+    private func showDrinkConfirmationToast(amount: Double) {
+        let message = drinkConfirmationMessage()
+        showToast(message: message)
+    }
+
+    private func showToast(message: String) {
+        toastPanel?.orderOut(nil)
+
+        let width: CGFloat = 280
+        let height: CGFloat = 42
+
+        guard let screen = NSScreen.main else { return }
+        let sf = screen.frame
+        let vf = screen.visibleFrame
+        let menuBarHeight = sf.height - (vf.origin.y + vf.height)
+        let x = (sf.width - width) / 2
+        let visibleY = sf.height - menuBarHeight - height - 10
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: x, y: visibleY + height, width: width, height: 0),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating + 1
+        panel.collectionBehavior = [.canJoinAllSpaces]
+        panel.ignoresMouseEvents = true
+
+        // 容器 view（圆角 + 阴影）
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 12
+        container.layer?.masksToBounds = true
+        panel.contentView = container
+
+        let blur = NSVisualEffectView(frame: container.bounds)
+        blur.autoresizingMask = [.width, .height]
+        blur.blendingMode = .withinWindow
+        blur.state = .active
+        blur.material = .popover
+        container.addSubview(blur)
+
+        let label = NSTextField(labelWithString: message)
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = .labelColor
+        label.alignment = .center
+        label.frame = NSRect(x: 16, y: 10, width: width - 32, height: 22)
+        container.addSubview(label)
+
+        toastPanel = panel
+        panel.orderFront(nil)
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.3
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(
+                NSRect(x: x, y: visibleY, width: width, height: height),
+                display: true
+            )
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().setFrame(
+                    NSRect(x: x, y: visibleY + height, width: width, height: 0),
+                    display: true
+                )
+            } completionHandler: {
+                panel.orderOut(nil)
+                if self?.toastPanel === panel { self?.toastPanel = nil }
             }
         }
     }
@@ -908,15 +1150,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         alert.runModal()
     }
 
-    // MARK: - UNUserNotificationCenterDelegate
-
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .sound])
-    }
 }
 
 // MARK: - 启动
