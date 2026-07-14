@@ -226,4 +226,4 @@ MIT
 ---
 
 *Made with 💧 for the desk-bound developer who always forgets to drink water.*
-*献给总是忘记喝水的开发者们。*
+*献给总是忘记喝水的工作者们。*
