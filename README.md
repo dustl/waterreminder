@@ -225,5 +225,5 @@ MIT
 
 ---
 
-*Made with 💧 for the desk-bound developer who always forgets to drink water.*
+*Made with 💧 for the desk-bound worker who always forgets to drink water.*
 *献给总是忘记喝水的工作者们。*
